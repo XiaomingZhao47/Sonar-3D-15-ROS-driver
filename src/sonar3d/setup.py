@@ -6,7 +6,7 @@ package_name = 'sonar3d'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='2.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -17,12 +17,12 @@ setup(
     zip_safe=True,
     maintainer='Water Linked',
     maintainer_email='support@waterlinked.com',
-    description='TODO: Package description',
+    description='ROS2 driver for Water Linked Sonar 3D-15',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'sonar_publisher = sonar3d.multicast_listener:main'
+            'sonar_publisher = sonar3d.multicast_listener:main',
+            'sonar_bag_converter = sonar3d.sonar_bag_converter:main',
         ],
     },
 )
