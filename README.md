@@ -67,7 +67,9 @@ ros2 run sonar3d sonar_bag_converter --mode multibyte_bag_to_bag --rosbag <input
 You can also specify a custom raw data topic:
 
 ```bash
-ros2 run sonar3d sonar_bag_converter --mode bag_to_bag --rosbag <bag-dir> --raw-topic /my/custom/topic
+ros2 run sonar3d sonar_bag_converter --mode bag_to_bag \
+    --rosbag /path/to/bag.db3 \
+    --raw-topic /tube1/sonar_raw
 ```
 
 ## PointCloud2 Fields
