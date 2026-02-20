@@ -20,10 +20,13 @@ USAGE:
   ros2 run sonar3d sonar_bag_converter --mode file_to_bag --file <sonar_recording_file>
 
   # Convert raw data in a ROS2 bag to decoded point cloud / image bag:
-  ros2 run sonar3d sonar_bag_converter --mode bag_to_bag --rosbag <input_bag_dir>
+  ros2 run sonar3d sonar_bag_converter --mode bag_to_bag --rosbag <input_bag_dir_or_db3>
 
   # Convert raw sonar multibyte bag to decoded bag:
-  ros2 run sonar3d sonar_bag_converter --mode multibyte_bag_to_bag --rosbag <input_bag_dir>
+  ros2 run sonar3d sonar_bag_converter --mode multibyte_bag_to_bag --rosbag <input_bag_dir_or_db3>
+
+  # Wrap a bare .db3 file into a proper ROS2 bag directory (no decoding):
+  ros2 run sonar3d sonar_bag_converter --mode db3_to_bag --rosbag <file.db3>
 """
 
 import os
@@ -31,11 +34,14 @@ import sys
 import struct
 import zlib
 import math
+import shutil
 import argparse
 from enum import Enum
 from datetime import datetime, timezone
 
 import numpy as np
+import sqlite3 as sqlite3_lib
+import yaml
 
 # ROS2 imports
 import rclpy
@@ -46,9 +52,11 @@ from builtin_interfaces.msg import Time
 import rosbag2_py
 from rosidl_runtime_py.utilities import get_message
 
+# cv_bridge for image conversion
 from cv_bridge import CvBridge
 
-from sonar_3d_15_protocol_pb2 import (
+# Protobuf definitions (must be in PYTHONPATH or same directory)
+from sonar3d.sonar_3d_15_protocol_pb2 import (
     Packet,
     BitmapImageGreyscale8,
     RangeImage,
@@ -62,7 +70,7 @@ SONAR_RAW_DATA_TOPIC = f"/{SONAR3D_FRAME}/raw_data_multibyte"
 SONAR_RANGE_IMAGE_TOPIC = f"/{SONAR3D_FRAME}/range_image"
 SONAR_POINT_CLOUD_TOPIC = f"/{SONAR3D_FRAME}/point_cloud"
 
-YEAR_CHECK = 2023  # year check
+YEAR_CHECK = 2023  # skip messages with year < this
 TIME_FORMAT = "%Y-%m-%d-%H%M%S"  # firmware >= 1.5.0
 RAW_DATA_FILE_PREFIX = "sonar-recording-"  # firmware >= 1.5.0
 
@@ -71,10 +79,11 @@ class Mode(Enum):
     FILE_TO_BAG = "file_to_bag"
     BAG_TO_BAG = "bag_to_bag"
     MULTIBYTE_BAG_TO_BAG = "multibyte_bag_to_bag"
+    DB3_TO_BAG = "db3_to_bag"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RIP1 / Protobuf helpers 
+# RIP1 / Protobuf helpers  (same logic as the original ROS1 driver)
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_rip1_packet(data: bytes) -> bytes | None:
     """Parse the RIP1 framing and return the protobuf payload, or None."""
@@ -91,6 +100,7 @@ def parse_rip1_packet(data: bytes) -> bytes | None:
     if crc_calculated != crc_received:
         return None
     return payload
+
 
 def decode_protobuf_packet(payload: bytes):
     """
@@ -189,7 +199,7 @@ def bitmap_to_image(bmp, stamp: Time, frame_id: str) -> Image:
     Convert a BitmapImageGreyscale8 protobuf message to sensor_msgs/msg/Image.
     """
     img_np = np.zeros((bmp.height, bmp.width), dtype=np.uint8)
-    for y in range(bmp.height - 1, 0, -1): 
+    for y in range(bmp.height - 1, 0, -1):  # flip vertically (matches ROS1 driver)
         for x in range(bmp.width):
             img_np[y, x] = bmp.image_pixel_data[y * bmp.width + x]
 
@@ -201,7 +211,7 @@ def bitmap_to_image(bmp, stamp: Time, frame_id: str) -> Image:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Packet handler     - returns (msg_type_int, ros_msg) or None
+# Packet handler  –  returns (msg_type_int, ros_msg) or None
 #   msg_type_int:  1 = Image (range_image topic)
 #                  2 = PointCloud2 (point_cloud topic)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -231,7 +241,7 @@ def handle_packet(data: bytes, use_sensor_stamp: bool = True, override_stamp: Ti
         elif use_sensor_stamp:
             stamp = _sec_to_ros2_time(dt.timestamp())
         else:
-            # Use current wall-clock
+            # Use current wall-clock (not typical for bag conversion)
             now = datetime.now(timezone.utc).timestamp()
             stamp = _sec_to_ros2_time(now)
 
@@ -277,9 +287,13 @@ class Ros2BagWriter:
         self._writer.open(storage_options, converter_options)
         self._topics_created: set[str] = set()
 
+    _topic_id_counter: int = 0
+
     def _ensure_topic(self, topic: str, msg_type_str: str):
         if topic not in self._topics_created:
+            Ros2BagWriter._topic_id_counter += 1
             topic_info = rosbag2_py.TopicMetadata(
+                id=Ros2BagWriter._topic_id_counter,
                 name=topic,
                 type=msg_type_str,
                 serialization_format="cdr",
@@ -296,7 +310,7 @@ class Ros2BagWriter:
 
 
 class Ros2BagReader:
-    """Thin wrapper around rosbag2_py for reading."""
+    """Thin wrapper around rosbag2_py for reading. Accepts bag dirs or bare .db3 files."""
 
     def __init__(self, bag_path: str, storage_id: str = "sqlite3"):
         self._reader = rosbag2_py.SequentialReader()
@@ -307,7 +321,7 @@ class Ros2BagReader:
         )
         self._reader.open(storage_options, converter_options)
 
-        # build topic to type map
+        # Build topic → type map
         self._topic_type_map: dict[str, str] = {}
         for topic_info in self._reader.get_all_topics_and_types():
             self._topic_type_map[topic_info.name] = topic_info.type
@@ -334,7 +348,7 @@ def _stamp_to_ns(stamp: Time) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mode 1: sonar recording file -> ROS2 bag
+# Mode 1: sonar recording file → ROS2 bag
 # ──────────────────────────────────────────────────────────────────────────────
 def file_to_bag(filename: str):
     """Read a sonar recording file and write a ROS2 bag."""
@@ -375,15 +389,19 @@ def file_to_bag(filename: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mode 2: ROS2 bag (with raw_data_multibyte) to new ROS2 bag with decoded topics
-#         also copies all other topics
+# Mode 2: ROS2 bag (with raw_data_multibyte) → new ROS2 bag with decoded topics
+#   Also copies all other topics through.
 # ──────────────────────────────────────────────────────────────────────────────
 def bag_to_bag(input_bag_path: str, raw_topic: str = SONAR_RAW_DATA_TOPIC):
     """
     Read a ROS2 bag that contains raw sonar data (UInt8MultiArray), decode it,
     and write a new bag with point_cloud + range_image + all other topics.
     """
-    output_bag_path = input_bag_path.rstrip("/") + "_w_sonar"
+    # Derive output path: strip .db3 extension if present
+    base = input_bag_path.rstrip("/")
+    if base.endswith(".db3"):
+        base = base[:-4]
+    output_bag_path = base + "_w_sonar"
 
     print(f"Input bag:   {input_bag_path}")
     print(f"Output bag:  {output_bag_path}")
@@ -427,14 +445,7 @@ def bag_to_bag(input_bag_path: str, raw_topic: str = SONAR_RAW_DATA_TOPIC):
         else:
             # Pass through all other topics unchanged
             type_str = topic_type_map.get(topic, "std_msgs/msg/String")
-            if topic not in writer._topics_created:
-                topic_info = rosbag2_py.TopicMetadata(
-                    name=topic,
-                    type=type_str,
-                    serialization_format="cdr",
-                )
-                writer._writer.create_topic(topic_info)
-                writer._topics_created.add(topic)
+            writer._ensure_topic(topic, type_str)
             writer._writer.write(topic, data, timestamp_ns)
             n_other += 1
 
@@ -451,7 +462,10 @@ def multibyte_bag_to_bag(input_bag_path: str, raw_topic: str = SONAR_RAW_DATA_TO
     Same as bag_to_bag but uses the sensor-embedded timestamp from each packet
     rather than the bag-recorded timestamp.
     """
-    output_bag_path = input_bag_path.rstrip("/") + "_w_sonar"
+    base = input_bag_path.rstrip("/")
+    if base.endswith(".db3"):
+        base = base[:-4]
+    output_bag_path = base + "_w_sonar"
 
     print(f"Input bag:   {input_bag_path}")
     print(f"Output bag:  {output_bag_path}")
@@ -489,20 +503,156 @@ def multibyte_bag_to_bag(input_bag_path: str, raw_topic: str = SONAR_RAW_DATA_TO
                     writer.write(SONAR_POINT_CLOUD_TOPIC, ros_msg, "sensor_msgs/msg/PointCloud2", stamp_ns)
         else:
             type_str = topic_type_map.get(topic, "std_msgs/msg/String")
-            if topic not in writer._topics_created:
-                topic_info = rosbag2_py.TopicMetadata(
-                    name=topic,
-                    type=type_str,
-                    serialization_format="cdr",
-                )
-                writer._writer.create_topic(topic_info)
-                writer._topics_created.add(topic)
+            writer._ensure_topic(topic, type_str)
             writer._writer.write(topic, data, timestamp_ns)
             n_other += 1
 
     writer.close()
     print(f"\nDone. Sonar messages decoded: {n_sonar}, Other messages copied: {n_other}")
     print(f"Output bag: {output_bag_path}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper: wrap a bare .db3 file into a proper ROS2 bag directory
+# ──────────────────────────────────────────────────────────────────────────────
+def wrap_db3_as_bag_dir(db3_path: str) -> str:
+    """
+    Given a bare .db3 file (from a power-off or incomplete recording), create
+    a proper ROS2 bag directory with metadata.yaml so rosbag2_py can open it.
+
+    Returns the path to the newly created bag directory.
+    """
+    db3_path = os.path.abspath(db3_path)
+    bag_name = os.path.splitext(os.path.basename(db3_path))[0]
+    bag_dir = os.path.join(os.path.dirname(db3_path), bag_name)
+
+    # If the directory already exists and has metadata.yaml, just return it
+    metadata_path = os.path.join(bag_dir, "metadata.yaml")
+    if os.path.isdir(bag_dir) and os.path.isfile(metadata_path):
+        print(f"Bag directory already exists: {bag_dir}")
+        return bag_dir
+
+    os.makedirs(bag_dir, exist_ok=True)
+
+    # Copy or symlink the .db3 into the directory
+    dest_db3 = os.path.join(bag_dir, f"{bag_name}_0.db3")
+    if not os.path.exists(dest_db3):
+        shutil.copy2(db3_path, dest_db3)
+        print(f"Copied {db3_path} -> {dest_db3}")
+
+    # Read topics from the sqlite3 database to build metadata
+    topics_info = []
+    try:
+        conn = sqlite3_lib.connect(db3_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, type, serialization_format FROM topics")
+        rows = cursor.fetchall()
+
+        # Get message count per topic
+        for row in rows:
+            topic_id, name, msg_type, ser_format = row
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE topic_id=?", (topic_id,))
+            count = cursor.fetchone()[0]
+            topics_info.append({
+                "topic_metadata": {
+                    "name": name,
+                    "type": msg_type,
+                    "serialization_format": ser_format or "cdr",
+                },
+                "message_count": count,
+            })
+
+        # Get total duration
+        cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM messages")
+        ts_min, ts_max = cursor.fetchone()
+        duration_ns = (ts_max - ts_min) if (ts_min and ts_max) else 0
+        starting_time_ns = ts_min or 0
+
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        total_count = cursor.fetchone()[0]
+
+        conn.close()
+    except Exception as e:
+        print(f"WARNING: Could not read db3 metadata: {e}")
+        print("Creating minimal metadata.yaml — rosbag2_py will infer topics.")
+        topics_info = []
+        duration_ns = 0
+        starting_time_ns = 0
+        total_count = 0
+
+    # Build metadata.yaml
+    metadata = {
+        "rosbag2_bagfile_information": {
+            "version": 8,
+            "storage_identifier": "sqlite3",
+            "relative_file_paths": [f"{bag_name}_0.db3"],
+            "duration": {"nanoseconds": duration_ns},
+            "starting_time": {"nanoseconds_since_epoch": starting_time_ns},
+            "message_count": total_count,
+            "topics_with_message_count": topics_info,
+            "compression_format": "",
+            "compression_mode": "",
+            "files": [{
+                "path": f"{bag_name}_0.db3",
+                "starting_time": {"nanoseconds_since_epoch": starting_time_ns},
+                "duration": {"nanoseconds": duration_ns},
+                "message_count": total_count,
+            }],
+        }
+    }
+
+    with open(metadata_path, "w") as f:
+        yaml.dump(metadata, f, default_flow_style=False, sort_keys=False)
+
+    print(f"Created bag directory: {bag_dir}")
+    print(f"  metadata.yaml with {len(topics_info)} topics, {total_count} messages")
+    return bag_dir
+
+
+def ensure_bag_dir(path: str) -> str:
+    """
+    Accept either a bag directory or a bare .db3 file.
+    rosbag2_py can open bare .db3 files directly when storage_id='sqlite3'.
+    Returns the path as-is.
+    """
+    if path.endswith(".db3") and os.path.isfile(path):
+        print(f"Detected bare .db3 file: {path}")
+        print(f"  rosbag2_py will open it directly (no metadata.yaml needed)")
+    return path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mode 4: bare .db3 → proper ROS2 bag directory (no sonar decoding, just wrap)
+# ──────────────────────────────────────────────────────────────────────────────
+def db3_to_bag(db3_path: str):
+    """Verify a bare .db3 file is readable by rosbag2_py and list its topics."""
+    if not db3_path.endswith(".db3"):
+        print(f"WARNING: File does not end with .db3: {db3_path}")
+
+    print(f"Testing .db3 file: {db3_path}")
+
+    # Verify it's readable directly
+    try:
+        reader = Ros2BagReader(db3_path)
+        topic_map = reader.topic_type_map()
+        print(f"\nBag is valid. Topics found:")
+        for topic, type_str in topic_map.items():
+            print(f"  {topic}  →  {type_str}")
+        print(f"\nYou can use this .db3 directly with other modes:")
+        print(f"  --mode bag_to_bag --rosbag {db3_path}")
+    except Exception as e:
+        print(f"ERROR: Could not read .db3 file: {e}")
+        print(f"\nFalling back to metadata.yaml wrapping...")
+        bag_dir = wrap_db3_as_bag_dir(db3_path)
+        try:
+            reader = Ros2BagReader(bag_dir)
+            topic_map = reader.topic_type_map()
+            print(f"\nWrapped bag is valid. Topics:")
+            for topic, type_str in topic_map.items():
+                print(f"  {topic}  →  {type_str}")
+            print(f"\nUse with: --rosbag {bag_dir}")
+        except Exception as e2:
+            print(f"ERROR: Wrapped bag also failed: {e2}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -517,7 +667,7 @@ def main():
         type=str,
         required=True,
         choices=[m.value for m in Mode],
-        help="Conversion mode: file_to_bag | bag_to_bag | multibyte_bag_to_bag",
+        help="Conversion mode: file_to_bag | bag_to_bag | multibyte_bag_to_bag | db3_to_bag",
     )
     parser.add_argument(
         "--file",
@@ -529,7 +679,7 @@ def main():
         "--rosbag",
         type=str,
         default="",
-        help="Input ROS2 bag directory (for bag_to_bag / multibyte_bag_to_bag modes).",
+        help="Input ROS2 bag directory or bare .db3 file (auto-detected).",
     )
     parser.add_argument(
         "--raw-topic",
@@ -557,7 +707,8 @@ def main():
         if not os.path.exists(args.rosbag):
             print(f"ERROR: Bag not found: {args.rosbag}")
             sys.exit(1)
-        bag_to_bag(args.rosbag, raw_topic=args.raw_topic)
+        bag_path = ensure_bag_dir(args.rosbag)
+        bag_to_bag(bag_path, raw_topic=args.raw_topic)
 
     elif mode == Mode.MULTIBYTE_BAG_TO_BAG:
         if not args.rosbag:
@@ -566,7 +717,17 @@ def main():
         if not os.path.exists(args.rosbag):
             print(f"ERROR: Bag not found: {args.rosbag}")
             sys.exit(1)
-        multibyte_bag_to_bag(args.rosbag, raw_topic=args.raw_topic)
+        bag_path = ensure_bag_dir(args.rosbag)
+        multibyte_bag_to_bag(bag_path, raw_topic=args.raw_topic)
+
+    elif mode == Mode.DB3_TO_BAG:
+        if not args.rosbag:
+            print("ERROR: --rosbag is required for db3_to_bag mode.")
+            sys.exit(1)
+        if not os.path.isfile(args.rosbag):
+            print(f"ERROR: File not found: {args.rosbag}")
+            sys.exit(1)
+        db3_to_bag(args.rosbag)
 
 
 if __name__ == "__main__":
