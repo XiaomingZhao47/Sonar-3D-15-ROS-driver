@@ -55,7 +55,7 @@ from rosidl_runtime_py.utilities import get_message
 # cv_bridge for image conversion
 from cv_bridge import CvBridge
 
-# Protobuf definitions (must be in PYTHONPATH or same directory)
+# Protobuf definitions 
 from sonar3d.sonar_3d_15_protocol_pb2 import (
     Packet,
     BitmapImageGreyscale8,
@@ -83,7 +83,7 @@ class Mode(Enum):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RIP1 / Protobuf helpers  (same logic as the original ROS1 driver)
+# RIP1 / Protobuf helpers  
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_rip1_packet(data: bytes) -> bytes | None:
     """Parse the RIP1 framing and return the protobuf payload, or None."""
@@ -241,7 +241,6 @@ def handle_packet(data: bytes, use_sensor_stamp: bool = True, override_stamp: Ti
         elif use_sensor_stamp:
             stamp = _sec_to_ros2_time(dt.timestamp())
         else:
-            # Use current wall-clock (not typical for bag conversion)
             now = datetime.now(timezone.utc).timestamp()
             stamp = _sec_to_ros2_time(now)
 
@@ -321,7 +320,7 @@ class Ros2BagReader:
         )
         self._reader.open(storage_options, converter_options)
 
-        # Build topic → type map
+        # Build topic to type map
         self._topic_type_map: dict[str, str] = {}
         for topic_info in self._reader.get_all_topics_and_types():
             self._topic_type_map[topic_info.name] = topic_info.type
@@ -348,7 +347,7 @@ def _stamp_to_ns(stamp: Time) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mode 1: sonar recording file → ROS2 bag
+# Mode 1: sonar recording file to ROS2 bag
 # ──────────────────────────────────────────────────────────────────────────────
 def file_to_bag(filename: str):
     """Read a sonar recording file and write a ROS2 bag."""
@@ -389,7 +388,7 @@ def file_to_bag(filename: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mode 2: ROS2 bag (with raw_data_multibyte) → new ROS2 bag with decoded topics
+# Mode 2: ROS2 bag to new ROS2 bag with decoded topics
 #   Also copies all other topics through.
 # ──────────────────────────────────────────────────────────────────────────────
 def bag_to_bag(input_bag_path: str, raw_topic: str = SONAR_RAW_DATA_TOPIC):
@@ -490,7 +489,6 @@ def multibyte_bag_to_bag(input_bag_path: str, raw_topic: str = SONAR_RAW_DATA_TO
             for pkt in packets:
                 if len(pkt) == 0:
                     continue
-                # Use sensor timestamp (embedded in protobuf)
                 r = handle_packet(b"RIP1" + pkt, use_sensor_stamp=True)
                 if r is None:
                     continue
@@ -580,7 +578,6 @@ def wrap_db3_as_bag_dir(db3_path: str) -> str:
         starting_time_ns = 0
         total_count = 0
 
-    # Build metadata.yaml
     metadata = {
         "rosbag2_bagfile_information": {
             "version": 8,
@@ -622,7 +619,7 @@ def ensure_bag_dir(path: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mode 4: bare .db3 → proper ROS2 bag directory (no sonar decoding, just wrap)
+# Mode 4: bare .db3 to proper ROS2 bag directory (no sonar decoding, just wrap)
 # ──────────────────────────────────────────────────────────────────────────────
 def db3_to_bag(db3_path: str):
     """Verify a bare .db3 file is readable by rosbag2_py and list its topics."""
@@ -631,13 +628,12 @@ def db3_to_bag(db3_path: str):
 
     print(f"Testing .db3 file: {db3_path}")
 
-    # Verify it's readable directly
     try:
         reader = Ros2BagReader(db3_path)
         topic_map = reader.topic_type_map()
         print(f"\nBag is valid. Topics found:")
         for topic, type_str in topic_map.items():
-            print(f"  {topic}  →  {type_str}")
+            print(f"  {topic}  to  {type_str}")
         print(f"\nYou can use this .db3 directly with other modes:")
         print(f"  --mode bag_to_bag --rosbag {db3_path}")
     except Exception as e:
@@ -649,7 +645,7 @@ def db3_to_bag(db3_path: str):
             topic_map = reader.topic_type_map()
             print(f"\nWrapped bag is valid. Topics:")
             for topic, type_str in topic_map.items():
-                print(f"  {topic}  →  {type_str}")
+                print(f"  {topic}  to  {type_str}")
             print(f"\nUse with: --rosbag {bag_dir}")
         except Exception as e2:
             print(f"ERROR: Wrapped bag also failed: {e2}")
